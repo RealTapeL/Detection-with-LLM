@@ -40,6 +40,71 @@ last_detection_data = []
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "deepseek-r1:1.5b"
 
+API_BASE_URL = ""
+API_KEY = ""
+API_MODEL = ""
+
+def get_ollama_models():
+    """获取本地Ollama可用模型列表"""
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            return [m["name"] for m in models] if models else ["deepseek-r1:1.5b"]
+    except:
+        pass
+    return ["deepseek-r1:1.5b"]
+
+def call_llm(user_question, provider, model_name, api_url="", api_key=""):
+    """调用LLM分析检测结果，支持Ollama本地和API调用"""
+    global last_detection_data
+    if not last_detection_data:
+        return "[ERROR] 尚未进行目标检测，请先检测图片。"
+    
+    detection_text = json.dumps(last_detection_data, ensure_ascii=False, indent=2)
+    system_prompt = f"""你是一位计算机视觉分析助手。以下是YOLO目标检测的结果：
+
+{detection_text}
+
+请基于以上数据回答用户问题。"""
+    
+    prompt = user_question if user_question else "请描述检测到的物体及其位置关系。"
+    
+    try:
+        if provider == "Ollama本地":
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": model_name,
+                    "prompt": prompt,
+                    "system": system_prompt,
+                    "stream": False
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            answer = response.json().get("response", "AI 未返回有效回答")
+            answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+            return answer
+        else:
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                "stream": False
+            }
+            response = requests.post(api_url, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                return data["choices"][0]["message"]["content"]
+            return "API 返回格式异常"
+    except Exception as e:
+        return f"[ERROR] AI 调用失败: {str(e)}"
+
 camera_running = False
 camera_capture = None
 camera_frame_lock = threading.Lock()
@@ -152,58 +217,35 @@ def detect_image(image, conf_threshold=0.25, iou_threshold=0.45):
     except Exception as e:
         return None, f"[ERROR] 检测失败: {str(e)}"
 
-def call_ollama(user_question=""):
-    """调用本地 Ollama 分析检测结果"""
-    global last_detection_data
-    if not last_detection_data:
-        return "[ERROR] 尚未进行目标检测，请先检测图片。"
-    
-    detection_text = json.dumps(last_detection_data, ensure_ascii=False, indent=2)
-    system_prompt = f"""你是一位计算机视觉分析助手。以下是YOLO目标检测的结果，包含每个检测对象的类别、置信度和边界框坐标（格式为 [x1, y1, x2, y2]，对应左上角和右下角像素坐标）：
-
-{detection_text}
-
-请基于以上数据回答用户问题。分析时请考虑物体的位置关系、数量、置信度等信息。"""
-    
-    prompt = user_question if user_question else "请描述检测到的物体及其位置关系，并给出简要分析。"
-    
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "system": system_prompt,
-                "stream": False
-            },
-            timeout=120
-        )
-        response.raise_for_status()
-        answer = response.json().get("response", "AI 未返回有效回答")
-        # 清理 DeepSeek-R1 的 <think> 思考过程标签
-        answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
-        return answer
-    except Exception as e:
-        return f"[ERROR] AI 调用失败: {str(e)}"
-
-def ai_quick_analyze():
+def ai_quick_analyze(provider, model, api_url, api_key):
     """一键分析当前检测结果"""
-    return call_ollama()
+    return call_llm("", provider, model, api_url, api_key)
 
-def chat_with_ai(message, history):
+def chat_with_ai(message, history, provider, model, api_url, api_key):
     """AI 对话回调"""
     if not message.strip():
         return history, ""
-    answer = call_ollama(message)
+    answer = call_llm(message, provider, model, api_url, api_key)
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": answer})
     return history, ""
 
-def load_latest_detection():
-    """加载最新检测结果到 AI 页面"""
-    if last_detection_image is None:
-        return None, "暂无检测数据，请先在「目标检测」页面进行检测。"
-    return last_detection_image, json.dumps(last_detection_data, ensure_ascii=False, indent=2)
+def update_model_dropdown(provider):
+    """根据供应商更新模型下拉框"""
+    if provider == "Ollama本地":
+        models = get_ollama_models()
+        return gr.Dropdown(choices=models, value=models[0] if models else "deepseek-r1:1.5b")
+    elif provider == "DeepSeek API":
+        return gr.Dropdown(choices=["deepseek-chat", "deepseek-reasoner"], value="deepseek-chat")
+    else:
+        return gr.Dropdown(choices=["gpt-3.5-turbo", "gpt-4", "gpt-4o"], value="gpt-3.5-turbo")
+
+def update_provider_visibility(provider):
+    """根据供应商显示/隐藏API配置"""
+    if provider == "Ollama本地":
+        return gr.update(visible=False), gr.update(visible=False)
+    else:
+        return gr.update(visible=True), gr.update(visible=True)
 
 def detect_video(video, conf_threshold=0.25, iou_threshold=0.45):
     """对视频进行目标检测"""
@@ -424,10 +466,48 @@ def create_ui():
                     
                     # --- 右列：AI 对话 + 数据 ---
                     with gr.Column(scale=1):
+                        gr.Markdown("#### LLM 模型配置")
+                        with gr.Row():
+                            llm_provider = gr.Dropdown(
+                                choices=["Ollama本地", "DeepSeek API", "OpenAI API"],
+                                value="Ollama本地",
+                                label="模型来源"
+                            )
+                            llm_model = gr.Dropdown(
+                                choices=get_ollama_models(),
+                                value=get_ollama_models()[0] if get_ollama_models() else "deepseek-r1:1.5b",
+                                label="选择模型",
+                                allow_custom_value=True
+                            )
+                        
+                        api_url_input = gr.Textbox(
+                            label="API地址",
+                            placeholder="https://api.deepseek.com/v1/chat/completions",
+                            visible=False
+                        )
+                        api_key_input = gr.Textbox(
+                            label="API密钥",
+                            placeholder="sk-...",
+                            type="password",
+                            visible=False
+                        )
+                        
+                        llm_provider.change(
+                            fn=update_model_dropdown,
+                            inputs=llm_provider,
+                            outputs=llm_model
+                        )
+                        llm_provider.change(
+                            fn=update_provider_visibility,
+                            inputs=llm_provider,
+                            outputs=[api_url_input, api_key_input]
+                        )
+                        
+                        gr.Markdown("---")
                         gr.Markdown("#### AI 对话")
                         chatbot = gr.Chatbot(
-                            label="DeepSeek-R1 1.5B",
-                            height=400
+                            label="对话记录",
+                            height=300
                         )
                         with gr.Row():
                             chat_input = gr.Textbox(
@@ -442,7 +522,7 @@ def create_ui():
                         gr.Markdown("#### 检测数据 (JSON)")
                         ai_detection_json = gr.Textbox(
                             label="",
-                            lines=10,
+                            lines=6,
                             interactive=False
                         )
                 
@@ -454,11 +534,15 @@ def create_ui():
                 )
                 
                 # AI 功能按钮绑定
-                ai_quick_btn.click(fn=ai_quick_analyze, outputs=ai_quick_output)
+                ai_quick_btn.click(
+                    fn=ai_quick_analyze,
+                    inputs=[llm_provider, llm_model, api_url_input, api_key_input],
+                    outputs=ai_quick_output
+                )
                 
                 chat_send.click(
                     fn=chat_with_ai,
-                    inputs=[chat_input, chatbot],
+                    inputs=[chat_input, chatbot, llm_provider, llm_model, api_url_input, api_key_input],
                     outputs=[chatbot, chat_input]
                 )
                 

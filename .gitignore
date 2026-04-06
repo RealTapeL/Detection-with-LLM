@@ -64,3 +64,9 @@ Thumbs.db
 # Project specific
 *.tar.zst
 /tmp/
+
+# API Keys and Config
+config.py
+.env
+.env.local
+*.key
